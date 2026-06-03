@@ -22,6 +22,12 @@ def rows_to_dicts(cursor):
     cols = [desc[0] for desc in cursor.description]
     return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
+def ex(conn, sql, params=None):
+    """Execute with params safely converted to tuple."""
+    if params is None:
+        return conn.execute(sql)
+    return conn.execute(sql, tuple(params))
+
 def load_categories():
     if not CATEGORIES_PATH.exists():
         return {
@@ -78,7 +84,7 @@ def add_expense(date, amount, category, subcategory="", note=""):
     validate_category(category, subcategory)
 
     conn = get_client()
-    cur = conn.execute(
+    cur = ex(conn,
         "INSERT INTO expenses(date, amount, category, subcategory, note) VALUES (?,?,?,?,?)",
         [date, amount, category, subcategory, note]
     )
@@ -92,7 +98,7 @@ def list_expenses(start_date, end_date):
     end_date = validate_iso_date(end_date)
 
     conn = get_client()
-    cur = conn.execute(
+    cur = ex(conn,
         """
         SELECT id, date, amount, category, subcategory, note
         FROM expenses
@@ -121,14 +127,14 @@ def summarize(start_date, end_date, category=None):
 
     query += " GROUP BY category ORDER BY category ASC"
 
-    cur = conn.execute(query, params)
+    cur = ex(conn, query, params)
     return rows_to_dicts(cur)
 
 @mcp.tool()
 def get_expense(expense_id):
     '''Get a single expense entry by its ID.'''
     conn = get_client()
-    cur = conn.execute(
+    cur = ex(conn,
         "SELECT id, date, amount, category, subcategory, note FROM expenses WHERE id = ?",
         [expense_id]
     )
@@ -156,7 +162,7 @@ def update_expense(expense_id, date=None, amount=None, category=None, subcategor
     if subcategory is not None:
         if category is None:
             conn = get_client()
-            cur = conn.execute("SELECT category FROM expenses WHERE id = ?", [expense_id])
+            cur = ex(conn, "SELECT category FROM expenses WHERE id = ?", [expense_id])
             rows = rows_to_dicts(cur)
             if not rows:
                 return {"status": "not_found"}
@@ -172,7 +178,7 @@ def update_expense(expense_id, date=None, amount=None, category=None, subcategor
 
     params.append(expense_id)
     conn = get_client()
-    conn.execute(f"UPDATE expenses SET {', '.join(updates)} WHERE id = ?", params)
+    ex(conn, f"UPDATE expenses SET {', '.join(updates)} WHERE id = ?", params)
     conn.commit()
     return {"status": "ok"}
 
@@ -180,7 +186,7 @@ def update_expense(expense_id, date=None, amount=None, category=None, subcategor
 def delete_expense(expense_id):
     '''Delete an expense entry by its ID.'''
     conn = get_client()
-    conn.execute("DELETE FROM expenses WHERE id = ?", [expense_id])
+    ex(conn, "DELETE FROM expenses WHERE id = ?", [expense_id])
     conn.commit()
     return {"status": "ok"}
 
@@ -204,7 +210,7 @@ def monthly_summary(year, month):
         end_date = f"{year:04d}-{month + 1:02d}-01"
 
     conn = get_client()
-    cur = conn.execute(
+    cur = ex(conn,
         """
         SELECT category, SUM(amount) AS total_amount, COUNT(*) AS expense_count
         FROM expenses
