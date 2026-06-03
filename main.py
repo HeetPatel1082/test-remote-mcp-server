@@ -18,6 +18,11 @@ def get_client():
     """Creates a connection to Turso (cloud) or local SQLite (desktop)."""
     return libsql_client.create_client_sync(url=DB_URL, auth_token=DB_TOKEN)
 
+def rows_to_dicts(rs):
+    """Safely convert libsql ResultSet rows to plain dicts."""
+    cols = [c if isinstance(c, str) else c.name for c in rs.columns]
+    return [dict(zip(cols, row)) for row in rs.rows]
+
 def load_categories():
     if not CATEGORIES_PATH.exists():
         return {
@@ -95,8 +100,7 @@ def list_expenses(start_date, end_date):
             """,
             [start_date, end_date]
         )
-        cols = [col for col in rs.columns]
-        return [dict(zip(cols, row)) for row in rs.rows]
+        return rows_to_dicts(rs)
 
 @mcp.tool()
 def summarize(start_date, end_date, category=None):
@@ -117,8 +121,7 @@ def summarize(start_date, end_date, category=None):
         query += " GROUP BY category ORDER BY category ASC"
 
         rs = client.execute(query, params)
-        cols = [col for col in rs.columns]
-        return [dict(zip(cols, row)) for row in rs.rows]
+        return rows_to_dicts(rs)
 
 @mcp.tool()
 def get_expense(expense_id):
@@ -130,8 +133,7 @@ def get_expense(expense_id):
         )
         if not rs.rows:
             return {"found": False}
-        cols = [col for col in rs.columns]
-        return {"found": True, "expense": dict(zip(cols, rs.rows[0]))}
+        return {"found": True, "expense": rows_to_dicts(rs)[0]}
 
 @mcp.tool()
 def update_expense(expense_id, date=None, amount=None, category=None, subcategory=None, note=None):
@@ -155,8 +157,7 @@ def update_expense(expense_id, date=None, amount=None, category=None, subcategor
                 current = client.execute("SELECT category FROM expenses WHERE id = ?", [expense_id])
             if not current.rows:
                 return {"status": "not_found"}
-            current_cols = [col for col in current.columns]
-            current_row = dict(zip(current_cols, current.rows[0]))
+            current_row = rows_to_dicts(current)[0]
             validate_category(current_row["category"], subcategory)
         updates.append("subcategory = ?")
         params.append(subcategory)
@@ -209,8 +210,7 @@ def monthly_summary(year, month):
             """,
             [start_date, end_date]
         )
-        cols = [col for col in rs.columns]
-        return [dict(zip(cols, row)) for row in rs.rows]
+        return rows_to_dicts(rs)
 
 @mcp.resource("expense://categories", mime_type="application/json")
 def categories():
