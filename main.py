@@ -95,8 +95,8 @@ def list_expenses(start_date, end_date):
             """,
             [start_date, end_date]
         )
-        # Convert libsql Row objects to standard dictionaries
-        return [dict(row) for row in rs.rows]
+        cols = [col for col in rs.columns]
+        return [dict(zip(cols, row)) for row in rs.rows]
 
 @mcp.tool()
 def summarize(start_date, end_date, category=None):
@@ -117,7 +117,8 @@ def summarize(start_date, end_date, category=None):
         query += " GROUP BY category ORDER BY category ASC"
 
         rs = client.execute(query, params)
-        return [dict(row) for row in rs.rows]
+        cols = [col for col in rs.columns]
+        return [dict(zip(cols, row)) for row in rs.rows]
 
 @mcp.tool()
 def get_expense(expense_id):
@@ -129,7 +130,8 @@ def get_expense(expense_id):
         )
         if not rs.rows:
             return {"found": False}
-        return {"found": True, "expense": dict(rs.rows[0])}
+        cols = [col for col in rs.columns]
+        return {"found": True, "expense": dict(zip(cols, rs.rows[0]))}
 
 @mcp.tool()
 def update_expense(expense_id, date=None, amount=None, category=None, subcategory=None, note=None):
@@ -153,7 +155,9 @@ def update_expense(expense_id, date=None, amount=None, category=None, subcategor
                 current = client.execute("SELECT category FROM expenses WHERE id = ?", [expense_id])
             if not current.rows:
                 return {"status": "not_found"}
-            validate_category(current.rows[0]["category"], subcategory)
+            current_cols = [col for col in current.columns]
+            current_row = dict(zip(current_cols, current.rows[0]))
+            validate_category(current_row["category"], subcategory)
         updates.append("subcategory = ?")
         params.append(subcategory)
     if note is not None:
@@ -165,19 +169,15 @@ def update_expense(expense_id, date=None, amount=None, category=None, subcategor
 
     params.append(expense_id)
     with get_client() as client:
-        rs = client.execute(f"UPDATE expenses SET {', '.join(updates)} WHERE id = ?", params)
-        if rs.rows_affected == 0:
-            return {"status": "not_found", "updated": 0}
-        return {"status": "ok", "updated": rs.rows_affected}
+        client.execute(f"UPDATE expenses SET {', '.join(updates)} WHERE id = ?", params)
+        return {"status": "ok"}
 
 @mcp.tool()
 def delete_expense(expense_id):
     '''Delete an expense entry by its ID.'''
     with get_client() as client:
-        rs = client.execute("DELETE FROM expenses WHERE id = ?", [expense_id])
-        if rs.rows_affected == 0:
-            return {"status": "not_found", "deleted": 0}
-        return {"status": "ok", "deleted": rs.rows_affected}
+        client.execute("DELETE FROM expenses WHERE id = ?", [expense_id])
+        return {"status": "ok"}
 
 @mcp.tool()
 def list_categories():
@@ -209,7 +209,8 @@ def monthly_summary(year, month):
             """,
             [start_date, end_date]
         )
-        return [dict(row) for row in rs.rows]
+        cols = [col for col in rs.columns]
+        return [dict(zip(cols, row)) for row in rs.rows]
 
 @mcp.resource("expense://categories", mime_type="application/json")
 def categories():
