@@ -9,7 +9,7 @@ from fastmcp import FastMCP
 # Use /tmp or an environment variable for the database in cloud environments
 # because the root container directory is often read-only or ephemeral.
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = Path(os.environ.get("DATABASE_PATH", BASE_DIR / "expenses.db"))
+DB_PATH = Path(os.environ.get("DATABASE_PATH", "/tmp/expenses.db"))
 CATEGORIES_PATH = BASE_DIR / "categories.json"
 
 mcp = FastMCP("ExpenseTracker")
