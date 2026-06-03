@@ -19,7 +19,7 @@ DB_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "")
 JWT_SECRET = os.environ.get("JWT_SECRET", "change-me-in-production-please")
 JWT_EXPIRY_HOURS = int(os.environ.get("JWT_EXPIRY_HOURS", "72"))
 
-mcp = FastMCP("ExpenseTracker")
+mcp = FastMCP("ExpenseTracker", auth=None)
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 def get_conn():
