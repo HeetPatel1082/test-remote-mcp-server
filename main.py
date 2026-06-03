@@ -250,11 +250,7 @@ def categories():
     return json.dumps(load_categories(), indent=2)
 
 if __name__ == "__main__":
-    # CRITICAL FOR DEPLOYMENT: Clouds assign dynamic ports using the PORT environment variable.
-    # If the cloud assigns a port, we must run on HTTP using that port.
-    # Otherwise, fallback to standard stdio for local inspectors.
-    env_port = os.environ.get("PORT")
-    if env_port:
-        mcp.run(transport="http", host="0.0.0.0", port=int(env_port))
-    else:
-        mcp.run(transport="http", host="0.0.0.0", port=8000)
+    # Let FastMCP use its default production transport (stdio).
+    # FastMCP Cloud will automatically handle the deployment architecture 
+    # and expose an HTTP/SSE web URL for you on their dashboard!
+    mcp.run()
