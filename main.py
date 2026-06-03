@@ -1,12 +1,15 @@
 from datetime import date as date_cls
 import json
+import os
 from pathlib import Path
 import sqlite3
 
 from fastmcp import FastMCP
 
+# Use /tmp or an environment variable for the database in cloud environments
+# because the root container directory is often read-only or ephemeral.
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "expenses.db"
+DB_PATH = Path(os.environ.get("DATABASE_PATH", BASE_DIR / "expenses.db"))
 CATEGORIES_PATH = BASE_DIR / "categories.json"
 
 mcp = FastMCP("ExpenseTracker")
@@ -22,6 +25,14 @@ def get_connection():
 
 
 def load_categories():
+    # Defensive check to give a clear error if the file didn't make it into the build
+    if not CATEGORIES_PATH.exists():
+        # Fallback basic defaults so the server doesn't crash during pre-flight
+        return {
+            "Food": ["Groceries", "Dining"],
+            "Utilities": ["Electricity", "Internet"],
+            "Other": []
+        }
     with open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -52,6 +63,8 @@ def expense_row_to_dict(row):
 
 
 def init_db():
+    # Ensure the parent directory for the database exists
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with get_connection() as c:
         c.execute("""
             CREATE TABLE IF NOT EXISTS expenses(
@@ -237,4 +250,11 @@ def categories():
     return json.dumps(load_categories(), indent=2)
 
 if __name__ == "__main__":
-    mcp.run(transport="http", host="0.0.0.0", port=8000)
+    # CRITICAL FOR DEPLOYMENT: Clouds assign dynamic ports using the PORT environment variable.
+    # If the cloud assigns a port, we must run on HTTP using that port.
+    # Otherwise, fallback to standard stdio for local inspectors.
+    env_port = os.environ.get("PORT")
+    if env_port:
+        mcp.run(transport="http", host="0.0.0.0", port=int(env_port))
+    else:
+        mcp.run(transport="http", host="0.0.0.0", port=8000)
