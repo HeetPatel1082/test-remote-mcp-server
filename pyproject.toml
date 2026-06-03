@@ -6,5 +6,5 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "fastmcp>=3.4.0",
-    "libsql-client>=0.3.1",
+    "libsql-experimental>=0.0.16",
 ]

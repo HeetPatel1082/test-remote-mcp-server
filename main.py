@@ -2,13 +2,12 @@ from datetime import date as date_cls
 import json
 import os
 from pathlib import Path
-import libsql_client
+import libsql_experimental as libsql
 from fastmcp import FastMCP
 
 BASE_DIR = Path(__file__).resolve().parent
 CATEGORIES_PATH = BASE_DIR / "categories.json"
 
-# Grab Turso credentials, fallback to local file for desktop testing
 DB_URL = os.environ.get("TURSO_DATABASE_URL", f"file:{BASE_DIR / 'expenses.db'}")
 DB_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "")
 
@@ -16,12 +15,12 @@ mcp = FastMCP("ExpenseTracker")
 
 def get_client():
     """Creates a connection to Turso (cloud) or local SQLite (desktop)."""
-    return libsql_client.create_client_sync(url=DB_URL, auth_token=DB_TOKEN)
+    return libsql.connect(database=DB_URL, auth_token=DB_TOKEN)
 
-def rows_to_dicts(rs):
-    """Safely convert libsql ResultSet rows to plain dicts."""
-    cols = [c if isinstance(c, str) else c.name for c in rs.columns]
-    return [dict(zip(cols, row)) for row in rs.rows]
+def rows_to_dicts(cursor):
+    """Safely convert libsql cursor rows to plain dicts."""
+    cols = [desc[0] for desc in cursor.description]
+    return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
 def load_categories():
     if not CATEGORIES_PATH.exists():
@@ -52,19 +51,20 @@ def validate_category(category, subcategory=""):
 
 def init_db():
     try:
-        with get_client() as client:
-            client.execute("""
-                CREATE TABLE IF NOT EXISTS expenses(
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    date TEXT NOT NULL,
-                    amount REAL NOT NULL,
-                    category TEXT NOT NULL,
-                    subcategory TEXT DEFAULT '',
-                    note TEXT DEFAULT ''
-                )
-            """)
-            client.execute("CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date)")
-            client.execute("CREATE INDEX IF NOT EXISTS idx_expenses_category ON expenses(category)")
+        conn = get_client()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS expenses(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL,
+                amount REAL NOT NULL,
+                category TEXT NOT NULL,
+                subcategory TEXT DEFAULT '',
+                note TEXT DEFAULT ''
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_expenses_category ON expenses(category)")
+        conn.commit()
     except Exception as e:
         print(f"Database initialization skipped or failed: {e}")
 
@@ -77,12 +77,13 @@ def add_expense(date, amount, category, subcategory="", note=""):
     amount = validate_amount(amount)
     validate_category(category, subcategory)
 
-    with get_client() as client:
-        rs = client.execute(
-            "INSERT INTO expenses(date, amount, category, subcategory, note) VALUES (?,?,?,?,?)",
-            [date, amount, category, subcategory, note]
-        )
-        return {"status": "ok", "id": rs.last_insert_rowid}
+    conn = get_client()
+    cur = conn.execute(
+        "INSERT INTO expenses(date, amount, category, subcategory, note) VALUES (?,?,?,?,?)",
+        [date, amount, category, subcategory, note]
+    )
+    conn.commit()
+    return {"status": "ok", "id": cur.lastrowid}
 
 @mcp.tool()
 def list_expenses(start_date, end_date):
@@ -90,17 +91,17 @@ def list_expenses(start_date, end_date):
     start_date = validate_iso_date(start_date)
     end_date = validate_iso_date(end_date)
 
-    with get_client() as client:
-        rs = client.execute(
-            """
-            SELECT id, date, amount, category, subcategory, note
-            FROM expenses
-            WHERE date BETWEEN ? AND ?
-            ORDER BY id ASC
-            """,
-            [start_date, end_date]
-        )
-        return rows_to_dicts(rs)
+    conn = get_client()
+    cur = conn.execute(
+        """
+        SELECT id, date, amount, category, subcategory, note
+        FROM expenses
+        WHERE date BETWEEN ? AND ?
+        ORDER BY id ASC
+        """,
+        [start_date, end_date]
+    )
+    return rows_to_dicts(cur)
 
 @mcp.tool()
 def summarize(start_date, end_date, category=None):
@@ -110,30 +111,31 @@ def summarize(start_date, end_date, category=None):
     if category:
         validate_category(category)
 
-    with get_client() as client:
-        query = "SELECT category, SUM(amount) AS total_amount FROM expenses WHERE date BETWEEN ? AND ?"
-        params = [start_date, end_date]
+    conn = get_client()
+    query = "SELECT category, SUM(amount) AS total_amount FROM expenses WHERE date BETWEEN ? AND ?"
+    params = [start_date, end_date]
 
-        if category:
-            query += " AND category = ?"
-            params.append(category)
+    if category:
+        query += " AND category = ?"
+        params.append(category)
 
-        query += " GROUP BY category ORDER BY category ASC"
+    query += " GROUP BY category ORDER BY category ASC"
 
-        rs = client.execute(query, params)
-        return rows_to_dicts(rs)
+    cur = conn.execute(query, params)
+    return rows_to_dicts(cur)
 
 @mcp.tool()
 def get_expense(expense_id):
     '''Get a single expense entry by its ID.'''
-    with get_client() as client:
-        rs = client.execute(
-            "SELECT id, date, amount, category, subcategory, note FROM expenses WHERE id = ?",
-            [expense_id]
-        )
-        if not rs.rows:
-            return {"found": False}
-        return {"found": True, "expense": rows_to_dicts(rs)[0]}
+    conn = get_client()
+    cur = conn.execute(
+        "SELECT id, date, amount, category, subcategory, note FROM expenses WHERE id = ?",
+        [expense_id]
+    )
+    rows = rows_to_dicts(cur)
+    if not rows:
+        return {"found": False}
+    return {"found": True, "expense": rows[0]}
 
 @mcp.tool()
 def update_expense(expense_id, date=None, amount=None, category=None, subcategory=None, note=None):
@@ -153,12 +155,12 @@ def update_expense(expense_id, date=None, amount=None, category=None, subcategor
         params.append(category)
     if subcategory is not None:
         if category is None:
-            with get_client() as client:
-                current = client.execute("SELECT category FROM expenses WHERE id = ?", [expense_id])
-            if not current.rows:
+            conn = get_client()
+            cur = conn.execute("SELECT category FROM expenses WHERE id = ?", [expense_id])
+            rows = rows_to_dicts(cur)
+            if not rows:
                 return {"status": "not_found"}
-            current_row = rows_to_dicts(current)[0]
-            validate_category(current_row["category"], subcategory)
+            validate_category(rows[0]["category"], subcategory)
         updates.append("subcategory = ?")
         params.append(subcategory)
     if note is not None:
@@ -169,16 +171,18 @@ def update_expense(expense_id, date=None, amount=None, category=None, subcategor
         return {"status": "noop", "updated": 0}
 
     params.append(expense_id)
-    with get_client() as client:
-        client.execute(f"UPDATE expenses SET {', '.join(updates)} WHERE id = ?", params)
-        return {"status": "ok"}
+    conn = get_client()
+    conn.execute(f"UPDATE expenses SET {', '.join(updates)} WHERE id = ?", params)
+    conn.commit()
+    return {"status": "ok"}
 
 @mcp.tool()
 def delete_expense(expense_id):
     '''Delete an expense entry by its ID.'''
-    with get_client() as client:
-        client.execute("DELETE FROM expenses WHERE id = ?", [expense_id])
-        return {"status": "ok"}
+    conn = get_client()
+    conn.execute("DELETE FROM expenses WHERE id = ?", [expense_id])
+    conn.commit()
+    return {"status": "ok"}
 
 @mcp.tool()
 def list_categories():
@@ -199,18 +203,18 @@ def monthly_summary(year, month):
     else:
         end_date = f"{year:04d}-{month + 1:02d}-01"
 
-    with get_client() as client:
-        rs = client.execute(
-            """
-            SELECT category, SUM(amount) AS total_amount, COUNT(*) AS expense_count
-            FROM expenses
-            WHERE date >= ? AND date < ?
-            GROUP BY category
-            ORDER BY total_amount DESC, category ASC
-            """,
-            [start_date, end_date]
-        )
-        return rows_to_dicts(rs)
+    conn = get_client()
+    cur = conn.execute(
+        """
+        SELECT category, SUM(amount) AS total_amount, COUNT(*) AS expense_count
+        FROM expenses
+        WHERE date >= ? AND date < ?
+        GROUP BY category
+        ORDER BY total_amount DESC, category ASC
+        """,
+        [start_date, end_date]
+    )
+    return rows_to_dicts(cur)
 
 @mcp.resource("expense://categories", mime_type="application/json")
 def categories():
