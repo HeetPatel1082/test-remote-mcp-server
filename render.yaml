@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: heet-expenses-mcp
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: JWT_EXPIRY_HOURS
+        value: "72"

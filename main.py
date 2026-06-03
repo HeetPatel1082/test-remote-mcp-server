@@ -384,4 +384,6 @@ def categories():
     return json.dumps(load_categories(), indent=2)
 
 if __name__ == "__main__":
-    mcp.run()
+    import os
+    port = int(os.environ.get("PORT", 8080))
+    mcp.run(transport="http", host="0.0.0.0", port=port)
