@@ -2,32 +2,24 @@ from datetime import date as date_cls
 import json
 import os
 from pathlib import Path
-import sqlite3
-
+import libsql_client
 from fastmcp import FastMCP
 
-# Use /tmp or an environment variable for the database in cloud environments
-# because the root container directory is often read-only or ephemeral.
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = Path(os.environ.get("DATABASE_PATH", "/tmp/expenses.db"))
 CATEGORIES_PATH = BASE_DIR / "categories.json"
+
+# Grab Turso credentials, fallback to local file for desktop testing
+DB_URL = os.environ.get("TURSO_DATABASE_URL", f"file:{BASE_DIR / 'expenses.db'}")
+DB_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "")
 
 mcp = FastMCP("ExpenseTracker")
 
-
-def get_connection():
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA journal_mode = WAL")
-    connection.execute("PRAGMA synchronous = NORMAL")
-    return connection
-
+def get_client():
+    """Creates a connection to Turso (cloud) or local SQLite (desktop)."""
+    return libsql_client.create_client_sync(url=DB_URL, auth_token=DB_TOKEN)
 
 def load_categories():
-    # Defensive check to give a clear error if the file didn't make it into the build
     if not CATEGORIES_PATH.exists():
-        # Fallback basic defaults so the server doesn't crash during pre-flight
         return {
             "Food": ["Groceries", "Dining"],
             "Utilities": ["Electricity", "Internet"],
@@ -36,11 +28,9 @@ def load_categories():
     with open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
-
 def validate_iso_date(value):
     date_cls.fromisoformat(value)
     return value
-
 
 def validate_amount(value):
     amount = float(value)
@@ -48,36 +38,30 @@ def validate_amount(value):
         raise ValueError("amount must be non-zero")
     return amount
 
-
 def validate_category(category, subcategory=""):
     categories = load_categories()
     if category not in categories:
         raise ValueError(f"Unknown category: {category}")
-
     if subcategory and subcategory not in categories[category]:
         raise ValueError(f"Unknown subcategory '{subcategory}' for category '{category}'")
 
-
-def expense_row_to_dict(row):
-    return dict(row)
-
-
 def init_db():
-    # Ensure the parent directory for the database exists
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with get_connection() as c:
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS expenses(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                date TEXT NOT NULL,
-                amount REAL NOT NULL,
-                category TEXT NOT NULL,
-                subcategory TEXT DEFAULT '',
-                note TEXT DEFAULT ''
-            )
-        """)
-        c.execute("CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_expenses_category ON expenses(category)")
+    try:
+        with get_client() as client:
+            client.execute("""
+                CREATE TABLE IF NOT EXISTS expenses(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    date TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    category TEXT NOT NULL,
+                    subcategory TEXT DEFAULT '',
+                    note TEXT DEFAULT ''
+                )
+            """)
+            client.execute("CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date)")
+            client.execute("CREATE INDEX IF NOT EXISTS idx_expenses_category ON expenses(category)")
+    except Exception as e:
+        print(f"Database initialization skipped or failed: {e}")
 
 init_db()
 
@@ -88,12 +72,12 @@ def add_expense(date, amount, category, subcategory="", note=""):
     amount = validate_amount(amount)
     validate_category(category, subcategory)
 
-    with get_connection() as c:
-        cur = c.execute(
+    with get_client() as client:
+        rs = client.execute(
             "INSERT INTO expenses(date, amount, category, subcategory, note) VALUES (?,?,?,?,?)",
-            (date, amount, category, subcategory, note)
+            [date, amount, category, subcategory, note]
         )
-        return {"status": "ok", "id": cur.lastrowid}
+        return {"status": "ok", "id": rs.last_insert_rowid}
 
 @mcp.tool()
 def list_expenses(start_date, end_date):
@@ -101,17 +85,18 @@ def list_expenses(start_date, end_date):
     start_date = validate_iso_date(start_date)
     end_date = validate_iso_date(end_date)
 
-    with get_connection() as c:
-        cur = c.execute(
+    with get_client() as client:
+        rs = client.execute(
             """
             SELECT id, date, amount, category, subcategory, note
             FROM expenses
             WHERE date BETWEEN ? AND ?
             ORDER BY id ASC
             """,
-            (start_date, end_date)
+            [start_date, end_date]
         )
-        return [expense_row_to_dict(r) for r in cur.fetchall()]
+        # Convert libsql Row objects to standard dictionaries
+        return [dict(row) for row in rs.rows]
 
 @mcp.tool()
 def summarize(start_date, end_date, category=None):
@@ -121,14 +106,8 @@ def summarize(start_date, end_date, category=None):
     if category:
         validate_category(category)
 
-    with get_connection() as c:
-        query = (
-            """
-            SELECT category, SUM(amount) AS total_amount
-            FROM expenses
-            WHERE date BETWEEN ? AND ?
-            """
-        )
+    with get_client() as client:
+        query = "SELECT category, SUM(amount) AS total_amount FROM expenses WHERE date BETWEEN ? AND ?"
         params = [start_date, end_date]
 
         if category:
@@ -137,23 +116,20 @@ def summarize(start_date, end_date, category=None):
 
         query += " GROUP BY category ORDER BY category ASC"
 
-        cur = c.execute(query, params)
-        return [expense_row_to_dict(r) for r in cur.fetchall()]
-
+        rs = client.execute(query, params)
+        return [dict(row) for row in rs.rows]
 
 @mcp.tool()
 def get_expense(expense_id):
     '''Get a single expense entry by its ID.'''
-    with get_connection() as c:
-        cur = c.execute(
+    with get_client() as client:
+        rs = client.execute(
             "SELECT id, date, amount, category, subcategory, note FROM expenses WHERE id = ?",
-            (expense_id,)
+            [expense_id]
         )
-        row = cur.fetchone()
-        if row is None:
+        if not rs.rows:
             return {"found": False}
-        return {"found": True, "expense": expense_row_to_dict(row)}
-
+        return {"found": True, "expense": dict(rs.rows[0])}
 
 @mcp.tool()
 def update_expense(expense_id, date=None, amount=None, category=None, subcategory=None, note=None):
@@ -164,26 +140,22 @@ def update_expense(expense_id, date=None, amount=None, category=None, subcategor
     if date is not None:
         updates.append("date = ?")
         params.append(validate_iso_date(date))
-
     if amount is not None:
         updates.append("amount = ?")
         params.append(validate_amount(amount))
-
     if category is not None:
         validate_category(category, subcategory or "")
         updates.append("category = ?")
         params.append(category)
-
     if subcategory is not None:
         if category is None:
-            with get_connection() as c:
-                current = c.execute("SELECT category FROM expenses WHERE id = ?", (expense_id,)).fetchone()
-            if current is None:
+            with get_client() as client:
+                current = client.execute("SELECT category FROM expenses WHERE id = ?", [expense_id])
+            if not current.rows:
                 return {"status": "not_found"}
-            validate_category(current["category"], subcategory)
+            validate_category(current.rows[0]["category"], subcategory)
         updates.append("subcategory = ?")
         params.append(subcategory)
-
     if note is not None:
         updates.append("note = ?")
         params.append(note)
@@ -192,31 +164,25 @@ def update_expense(expense_id, date=None, amount=None, category=None, subcategor
         return {"status": "noop", "updated": 0}
 
     params.append(expense_id)
-    with get_connection() as c:
-        cur = c.execute(
-            f"UPDATE expenses SET {', '.join(updates)} WHERE id = ?",
-            params,
-        )
-        if cur.rowcount == 0:
+    with get_client() as client:
+        rs = client.execute(f"UPDATE expenses SET {', '.join(updates)} WHERE id = ?", params)
+        if rs.rows_affected == 0:
             return {"status": "not_found", "updated": 0}
-        return {"status": "ok", "updated": cur.rowcount}
-
+        return {"status": "ok", "updated": rs.rows_affected}
 
 @mcp.tool()
 def delete_expense(expense_id):
     '''Delete an expense entry by its ID.'''
-    with get_connection() as c:
-        cur = c.execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
-        if cur.rowcount == 0:
+    with get_client() as client:
+        rs = client.execute("DELETE FROM expenses WHERE id = ?", [expense_id])
+        if rs.rows_affected == 0:
             return {"status": "not_found", "deleted": 0}
-        return {"status": "ok", "deleted": cur.rowcount}
-
+        return {"status": "ok", "deleted": rs.rows_affected}
 
 @mcp.tool()
 def list_categories():
     '''Return the full category and subcategory catalog.'''
     return load_categories()
-
 
 @mcp.tool()
 def monthly_summary(year, month):
@@ -232,8 +198,8 @@ def monthly_summary(year, month):
     else:
         end_date = f"{year:04d}-{month + 1:02d}-01"
 
-    with get_connection() as c:
-        cur = c.execute(
+    with get_client() as client:
+        rs = client.execute(
             """
             SELECT category, SUM(amount) AS total_amount, COUNT(*) AS expense_count
             FROM expenses
@@ -241,16 +207,13 @@ def monthly_summary(year, month):
             GROUP BY category
             ORDER BY total_amount DESC, category ASC
             """,
-            (start_date, end_date),
+            [start_date, end_date]
         )
-        return [expense_row_to_dict(r) for r in cur.fetchall()]
+        return [dict(row) for row in rs.rows]
 
 @mcp.resource("expense://categories", mime_type="application/json")
 def categories():
     return json.dumps(load_categories(), indent=2)
 
 if __name__ == "__main__":
-    # Let FastMCP use its default production transport (stdio).
-    # FastMCP Cloud will automatically handle the deployment architecture 
-    # and expose an HTTP/SSE web URL for you on their dashboard!
     mcp.run()
