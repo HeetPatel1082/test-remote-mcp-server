@@ -13,3 +13,5 @@ services:
         sync: false
       - key: JWT_EXPIRY_HOURS
         value: "72"
+      - key: MCP_BASE_URL
+        value: "https://heet-expenses-mcp.onrender.com"

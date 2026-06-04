@@ -4,11 +4,15 @@ import os
 import secrets
 import hashlib
 from pathlib import Path
+from urllib.parse import urlencode
 
 import bcrypt
 import jwt
 import libsql_experimental as libsql
 from fastmcp import FastMCP
+from fastapi import FastAPI, Request, Form
+from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
@@ -18,6 +22,7 @@ DB_URL   = os.environ.get("TURSO_DATABASE_URL", f"file:{BASE_DIR / 'expenses.db'
 DB_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "")
 JWT_SECRET = os.environ.get("JWT_SECRET", "change-me-in-production-please")
 JWT_EXPIRY_HOURS = int(os.environ.get("JWT_EXPIRY_HOURS", "72"))
+BASE_URL = os.environ.get("MCP_BASE_URL", "https://heet-expenses-mcp.onrender.com")
 
 mcp = FastMCP("ExpenseTracker", auth=None)
 
@@ -69,12 +74,13 @@ def verify_password(password: str, hashed: str) -> bool:
 def generate_api_key() -> str:
     return "ek_" + secrets.token_hex(32)
 
-def generate_jwt(user_id: int, username: str) -> str:
+def generate_jwt(user_id: int, username: str, days: int = None, hours: int = None) -> str:
+    expiry = timedelta(days=days) if days else timedelta(hours=hours or JWT_EXPIRY_HOURS)
     payload = {
         "sub": user_id,
         "username": username,
         "iat": datetime.now(timezone.utc),
-        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRY_HOURS),
+        "exp": datetime.now(timezone.utc) + expiry,
     }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
@@ -111,7 +117,6 @@ def init_db():
     try:
         conn = get_conn()
 
-        # Users table
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -126,7 +131,6 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_users_api_key ON users(api_key)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
 
-        # Expenses table with user_id
         conn.execute("""
             CREATE TABLE IF NOT EXISTS expenses (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -141,6 +145,17 @@ def init_db():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_expenses_user_date ON expenses(user_id, date)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_expenses_user_cat  ON expenses(user_id, category)")
+
+        # OAuth authorization codes — short-lived, single-use
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS oauth_codes (
+                code         TEXT PRIMARY KEY,
+                user_id      INTEGER NOT NULL,
+                redirect_uri TEXT NOT NULL,
+                expires_at   TEXT NOT NULL,
+                used         INTEGER NOT NULL DEFAULT 0
+            )
+        """)
 
         conn.commit()
         print("Database initialized successfully")
@@ -158,8 +173,6 @@ def register(username: str, email: str, password: str):
         return {"status": "error", "message": "Password must be at least 8 characters"}
 
     conn = get_conn()
-
-    # Check existing
     cur = ex(conn, "SELECT id FROM users WHERE email = ? OR username = ?", [email, username])
     if cur.fetchone():
         return {"status": "error", "message": "Username or email already exists"}
@@ -196,10 +209,8 @@ def login(email: str, password: str):
         return {"status": "error", "message": "Invalid email or password"}
 
     user = rows[0]
-
     if not user["is_active"]:
         return {"status": "error", "message": "Account is inactive"}
-
     if not verify_password(password, user["password"]):
         return {"status": "error", "message": "Invalid email or password"}
 
@@ -280,30 +291,23 @@ def update_expense(expense_id: int, date: str = None, amount=None, category: str
     """Update fields on an existing expense (must belong to authenticated user)."""
     user = resolve_user(api_key, token)
 
-    # Verify ownership
     conn = get_conn()
     cur = ex(conn, "SELECT id FROM expenses WHERE id = ? AND user_id = ?", [expense_id, user["id"]])
     if not cur.fetchone():
         return {"status": "not_found"}
 
     updates, params = [], []
-
     if date is not None:
-        updates.append("date = ?")
-        params.append(validate_iso_date(date))
+        updates.append("date = ?"); params.append(validate_iso_date(date))
     if amount is not None:
-        updates.append("amount = ?")
-        params.append(validate_amount(amount))
+        updates.append("amount = ?"); params.append(validate_amount(amount))
     if category is not None:
         validate_category(category, subcategory or "")
-        updates.append("category = ?")
-        params.append(category)
+        updates.append("category = ?"); params.append(category)
     if subcategory is not None:
-        updates.append("subcategory = ?")
-        params.append(subcategory)
+        updates.append("subcategory = ?"); params.append(subcategory)
     if note is not None:
-        updates.append("note = ?")
-        params.append(note)
+        updates.append("note = ?"); params.append(note)
 
     if not updates:
         return {"status": "noop"}
@@ -340,12 +344,10 @@ def summarize(start_date: str, end_date: str, category: str = None,
     conn  = get_conn()
     query  = "SELECT category, SUM(amount) AS total_amount FROM expenses WHERE user_id = ? AND date BETWEEN ? AND ?"
     params = [user["id"], start_date, end_date]
-
     if category:
-        query += " AND category = ?"
-        params.append(category)
-
+        query += " AND category = ?"; params.append(category)
     query += " GROUP BY category ORDER BY total_amount DESC"
+
     cur = ex(conn, query, params)
     return rows_to_dicts(cur)
 
@@ -383,7 +385,275 @@ def list_categories():
 def categories():
     return json.dumps(load_categories(), indent=2)
 
+# ── Login page HTML ───────────────────────────────────────────────────────────
+def _login_page(redirect_uri: str, state: str, error: str = "") -> str:
+    error_html = f'<p class="error">{error}</p>' if error else ""
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Expense Tracker — Sign In</title>
+  <style>
+    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #0f0f13;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      color: #e2e8f0;
+    }}
+    .card {{
+      background: #1a1a24;
+      border: 1px solid #2d2d3d;
+      border-radius: 16px;
+      padding: 40px;
+      width: 100%;
+      max-width: 400px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+    }}
+    .logo {{
+      font-size: 28px;
+      margin-bottom: 6px;
+      text-align: center;
+    }}
+    h1 {{
+      font-size: 20px;
+      font-weight: 600;
+      text-align: center;
+      margin-bottom: 6px;
+      color: #f1f5f9;
+    }}
+    .subtitle {{
+      text-align: center;
+      font-size: 13px;
+      color: #64748b;
+      margin-bottom: 28px;
+    }}
+    label {{
+      display: block;
+      font-size: 13px;
+      font-weight: 500;
+      color: #94a3b8;
+      margin-bottom: 6px;
+    }}
+    input {{
+      width: 100%;
+      padding: 11px 14px;
+      background: #0f0f13;
+      border: 1px solid #2d2d3d;
+      border-radius: 8px;
+      color: #f1f5f9;
+      font-size: 14px;
+      margin-bottom: 18px;
+      outline: none;
+      transition: border-color 0.2s;
+    }}
+    input:focus {{ border-color: #6366f1; }}
+    button {{
+      width: 100%;
+      padding: 12px;
+      background: #6366f1;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }}
+    button:hover {{ background: #4f46e5; }}
+    .error {{
+      background: #3f1515;
+      border: 1px solid #7f1d1d;
+      color: #fca5a5;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 13px;
+      margin-bottom: 18px;
+    }}
+    .footer {{
+      text-align: center;
+      margin-top: 20px;
+      font-size: 12px;
+      color: #334155;
+    }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">💸</div>
+    <h1>Expense Tracker</h1>
+    <p class="subtitle">Sign in to connect with Claude</p>
+    {error_html}
+    <form method="POST" action="/login">
+      <input type="hidden" name="redirect_uri" value="{redirect_uri}">
+      <input type="hidden" name="state" value="{state}">
+      <label for="email">Email</label>
+      <input type="email" id="email" name="email" placeholder="you@example.com" required autofocus>
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" placeholder="••••••••" required>
+      <button type="submit">Sign In</button>
+    </form>
+    <p class="footer">Your data stays private — this only authorizes Claude to access your expenses.</p>
+  </div>
+</body>
+</html>"""
+
+# ── OAuth routes ──────────────────────────────────────────────────────────────
+def _attach_oauth_routes(fastapi_app: FastAPI):
+
+    @fastapi_app.get("/.well-known/oauth-protected-resource")
+    @fastapi_app.get("/.well-known/oauth-protected-resource/mcp")
+    async def oauth_protected_resource():
+        return JSONResponse({
+            "resource": BASE_URL,
+            "authorization_servers": [BASE_URL],
+        })
+
+    @fastapi_app.get("/.well-known/oauth-authorization-server")
+    async def oauth_authorization_server():
+        return JSONResponse({
+            "issuer": BASE_URL,
+            "authorization_endpoint": f"{BASE_URL}/authorize",
+            "token_endpoint": f"{BASE_URL}/token",
+            "registration_endpoint": f"{BASE_URL}/register",
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code"],
+            "code_challenge_methods_supported": ["S256"],
+        })
+
+    @fastapi_app.post("/register")
+    async def register_oauth_client(request: Request):
+        body = await request.json()
+        return JSONResponse({
+            "client_id": "claude-client-" + secrets.token_hex(8),
+            "client_secret": "not-a-real-secret",
+            "redirect_uris": body.get("redirect_uris", []),
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "client_secret_post",
+        })
+
+    @fastapi_app.get("/authorize")
+    async def authorize(
+        redirect_uri: str = "",
+        state: str = "",
+        response_type: str = "code",
+        client_id: str = "",
+        code_challenge: str = "",
+        code_challenge_method: str = "",
+    ):
+        return HTMLResponse(_login_page(redirect_uri, state))
+
+    @fastapi_app.get("/login")
+    async def login_get(redirect_uri: str = "", state: str = ""):
+        return HTMLResponse(_login_page(redirect_uri, state))
+
+    @fastapi_app.post("/login")
+    async def login_post(
+        request: Request,
+        email: str = Form(...),
+        password: str = Form(...),
+        redirect_uri: str = Form(...),
+        state: str = Form(""),
+    ):
+        try:
+            conn = get_conn()
+            cur = ex(conn, "SELECT id, username, password, is_active FROM users WHERE email = ?", [email])
+            rows = rows_to_dicts(cur)
+        except Exception:
+            return HTMLResponse(_login_page(redirect_uri, state, error="Database error, please try again."))
+
+        if not rows:
+            return HTMLResponse(_login_page(redirect_uri, state, error="Invalid email or password."))
+
+        user = rows[0]
+        if not user["is_active"]:
+            return HTMLResponse(_login_page(redirect_uri, state, error="Account is inactive."))
+        if not verify_password(password, user["password"]):
+            return HTMLResponse(_login_page(redirect_uri, state, error="Invalid email or password."))
+
+        # Short-lived auth code stored in Turso (expires in 10 min, single-use)
+        code = secrets.token_urlsafe(32)
+        expires_at = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+        try:
+            ex(conn,
+                "INSERT INTO oauth_codes(code, user_id, redirect_uri, expires_at) VALUES (?,?,?,?)",
+                [code, user["id"], redirect_uri, expires_at]
+            )
+            conn.commit()
+        except Exception:
+            return HTMLResponse(_login_page(redirect_uri, state, error="Failed to create session, please try again."))
+
+        separator = "&" if "?" in redirect_uri else "?"
+        return RedirectResponse(
+            url=f"{redirect_uri}{separator}code={code}&state={state}",
+            status_code=302
+        )
+
+    @fastapi_app.post("/token")
+    async def token(request: Request):
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            body = await request.json()
+            code = body.get("code", "")
+        else:
+            form = await request.form()
+            code = form.get("code", "")
+
+        if not code:
+            return JSONResponse({"error": "missing code"}, status_code=400)
+
+        try:
+            conn = get_conn()
+            cur = ex(conn,
+                "SELECT user_id, expires_at, used FROM oauth_codes WHERE code = ?",
+                [code]
+            )
+            rows = rows_to_dicts(cur)
+        except Exception:
+            return JSONResponse({"error": "database error"}, status_code=500)
+
+        if not rows:
+            return JSONResponse({"error": "invalid code"}, status_code=400)
+
+        row = rows[0]
+
+        if row["used"]:
+            return JSONResponse({"error": "code already used"}, status_code=400)
+
+        expires_at = datetime.fromisoformat(row["expires_at"])
+        if datetime.now(timezone.utc) > expires_at:
+            return JSONResponse({"error": "code expired"}, status_code=400)
+
+        # Mark code as used (single-use enforcement)
+        ex(conn, "UPDATE oauth_codes SET used = 1 WHERE code = ?", [code])
+        conn.commit()
+
+        # Fetch user and issue 30-day JWT
+        cur = ex(conn, "SELECT id, username FROM users WHERE id = ? AND is_active = 1", [row["user_id"]])
+        user_rows = rows_to_dicts(cur)
+        if not user_rows:
+            return JSONResponse({"error": "user not found"}, status_code=400)
+
+        user = user_rows[0]
+        long_lived_token = generate_jwt(user["id"], user["username"], days=30)
+
+        return JSONResponse({
+            "access_token": long_lived_token,
+            "token_type": "bearer",
+            "expires_in": 30 * 24 * 3600,
+        })
+
+
 if __name__ == "__main__":
-    import os
+    import uvicorn
     port = int(os.environ.get("PORT", 8080))
-    mcp.run(transport="http", host="0.0.0.0", port=port)
+
+    fastapi_app = mcp.http_app()
+    _attach_oauth_routes(fastapi_app)
+
+    uvicorn.run(fastapi_app, host="0.0.0.0", port=port)
