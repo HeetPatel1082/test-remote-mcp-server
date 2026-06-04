@@ -653,7 +653,10 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8080))
 
-    fastapi_app = mcp.http_app()
+    # Create a real FastAPI app so we can register routes on it,
+    # then mount the MCP Starlette app inside it at /mcp.
+    fastapi_app = FastAPI(title="ExpenseTracker MCP")
     _attach_oauth_routes(fastapi_app)
+    fastapi_app.mount("/", mcp.http_app())
 
     uvicorn.run(fastapi_app, host="0.0.0.0", port=port)
