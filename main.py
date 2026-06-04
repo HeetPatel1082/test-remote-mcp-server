@@ -2,9 +2,7 @@ from datetime import date as date_cls, datetime, timezone, timedelta
 import json
 import os
 import secrets
-import hashlib
 from pathlib import Path
-from urllib.parse import urlencode
 
 import bcrypt
 import jwt
@@ -12,17 +10,16 @@ import libsql_experimental as libsql
 from fastmcp import FastMCP
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse
-from starlette.middleware.base import BaseHTTPMiddleware
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
 CATEGORIES_PATH = BASE_DIR / "categories.json"
 
-DB_URL   = os.environ.get("TURSO_DATABASE_URL", f"file:{BASE_DIR / 'expenses.db'}")
-DB_TOKEN = os.environ.get("TURSO_AUTH_TOKEN", "")
-JWT_SECRET = os.environ.get("JWT_SECRET", "change-me-in-production-please")
+DB_URL          = os.environ.get("TURSO_DATABASE_URL", f"file:{BASE_DIR / 'expenses.db'}")
+DB_TOKEN        = os.environ.get("TURSO_AUTH_TOKEN", "")
+JWT_SECRET      = os.environ.get("JWT_SECRET", "change-me-in-production-please")
 JWT_EXPIRY_HOURS = int(os.environ.get("JWT_EXPIRY_HOURS", "72"))
-BASE_URL = os.environ.get("MCP_BASE_URL", "https://heet-expenses-mcp.onrender.com")
+BASE_URL        = os.environ.get("MCP_BASE_URL", "https://heet-expenses-mcp.onrender.com")
 
 mcp = FastMCP("ExpenseTracker", auth=None)
 
@@ -112,6 +109,16 @@ def resolve_user(api_key: str = None, token: str = None) -> dict:
             raise ValueError("User not found or inactive")
         return rows[0]
 
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def parse_utc(iso_str: str) -> datetime:
+    """Parse ISO datetime string, ensuring it's timezone-aware UTC."""
+    dt = datetime.fromisoformat(iso_str)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
 # ── DB Init ───────────────────────────────────────────────────────────────────
 def init_db():
     try:
@@ -179,7 +186,7 @@ def register(username: str, email: str, password: str):
 
     hashed_pw  = hash_password(password)
     api_key    = generate_api_key()
-    created_at = datetime.now(timezone.utc).isoformat()
+    created_at = now_utc().isoformat()
 
     cur = ex(conn,
         "INSERT INTO users(username, email, password, api_key, created_at) VALUES (?,?,?,?,?)",
@@ -341,7 +348,7 @@ def summarize(start_date: str, end_date: str, category: str = None,
     if category:
         validate_category(category)
 
-    conn  = get_conn()
+    conn   = get_conn()
     query  = "SELECT category, SUM(amount) AS total_amount FROM expenses WHERE user_id = ? AND date BETWEEN ? AND ?"
     params = [user["id"], start_date, end_date]
     if category:
@@ -385,18 +392,10 @@ def list_categories():
 def categories():
     return json.dumps(load_categories(), indent=2)
 
-# ── Login page HTML ───────────────────────────────────────────────────────────
-def _login_page(redirect_uri: str, state: str, error: str = "") -> str:
-    error_html = f'<p class="error">{error}</p>' if error else ""
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Expense Tracker — Sign In</title>
-  <style>
-    *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
-    body {{
+# ── Shared HTML helpers ───────────────────────────────────────────────────────
+_BASE_STYLES = """
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
       min-height: 100vh;
       display: flex;
       align-items: center;
@@ -404,90 +403,75 @@ def _login_page(redirect_uri: str, state: str, error: str = "") -> str:
       background: #0f0f13;
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
       color: #e2e8f0;
-    }}
-    .card {{
+    }
+    .card {
       background: #1a1a24;
       border: 1px solid #2d2d3d;
       border-radius: 16px;
       padding: 40px;
       width: 100%;
-      max-width: 400px;
+      max-width: 420px;
       box-shadow: 0 20px 60px rgba(0,0,0,0.4);
-    }}
-    .logo {{
-      font-size: 28px;
-      margin-bottom: 6px;
-      text-align: center;
-    }}
-    h1 {{
-      font-size: 20px;
-      font-weight: 600;
-      text-align: center;
-      margin-bottom: 6px;
-      color: #f1f5f9;
-    }}
-    .subtitle {{
-      text-align: center;
-      font-size: 13px;
-      color: #64748b;
-      margin-bottom: 28px;
-    }}
-    label {{
-      display: block;
-      font-size: 13px;
-      font-weight: 500;
-      color: #94a3b8;
-      margin-bottom: 6px;
-    }}
-    input {{
-      width: 100%;
-      padding: 11px 14px;
-      background: #0f0f13;
-      border: 1px solid #2d2d3d;
-      border-radius: 8px;
-      color: #f1f5f9;
-      font-size: 14px;
-      margin-bottom: 18px;
-      outline: none;
-      transition: border-color 0.2s;
-    }}
-    input:focus {{ border-color: #6366f1; }}
-    button {{
-      width: 100%;
-      padding: 12px;
-      background: #6366f1;
-      color: #fff;
-      border: none;
-      border-radius: 8px;
-      font-size: 15px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: background 0.2s;
-    }}
-    button:hover {{ background: #4f46e5; }}
-    .error {{
-      background: #3f1515;
-      border: 1px solid #7f1d1d;
-      color: #fca5a5;
-      border-radius: 8px;
-      padding: 10px 14px;
-      font-size: 13px;
-      margin-bottom: 18px;
-    }}
-    .footer {{
-      text-align: center;
-      margin-top: 20px;
-      font-size: 12px;
-      color: #334155;
-    }}
-  </style>
+    }
+    .logo { font-size: 28px; margin-bottom: 6px; text-align: center; }
+    h1 { font-size: 20px; font-weight: 600; text-align: center; margin-bottom: 6px; color: #f1f5f9; }
+    .subtitle { text-align: center; font-size: 13px; color: #64748b; margin-bottom: 28px; }
+    label { display: block; font-size: 13px; font-weight: 500; color: #94a3b8; margin-bottom: 6px; }
+    input {
+      width: 100%; padding: 11px 14px;
+      background: #0f0f13; border: 1px solid #2d2d3d; border-radius: 8px;
+      color: #f1f5f9; font-size: 14px; margin-bottom: 18px;
+      outline: none; transition: border-color 0.2s;
+    }
+    input:focus { border-color: #6366f1; }
+    .btn {
+      width: 100%; padding: 12px; background: #6366f1; color: #fff;
+      border: none; border-radius: 8px; font-size: 15px; font-weight: 600;
+      cursor: pointer; transition: background 0.2s;
+    }
+    .btn:hover { background: #4f46e5; }
+    .btn-secondary {
+      width: 100%; padding: 11px; background: transparent; color: #94a3b8;
+      border: 1px solid #2d2d3d; border-radius: 8px; font-size: 14px;
+      cursor: pointer; transition: all 0.2s; margin-top: 10px; text-align: center;
+      text-decoration: none; display: block;
+    }
+    .btn-secondary:hover { border-color: #6366f1; color: #a5b4fc; }
+    .alert {
+      border-radius: 8px; padding: 10px 14px; font-size: 13px; margin-bottom: 18px;
+    }
+    .alert-error { background: #3f1515; border: 1px solid #7f1d1d; color: #fca5a5; }
+    .alert-success { background: #14291a; border: 1px solid #166534; color: #86efac; }
+    .divider { text-align: center; color: #334155; font-size: 12px; margin: 16px 0; }
+    .footer { text-align: center; margin-top: 20px; font-size: 12px; color: #334155; }
+"""
+
+def _html_shell(title: str, body: str) -> str:
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{title}</title>
+  <style>{_BASE_STYLES}</style>
 </head>
-<body>
+<body>{body}</body>
+</html>"""
+
+# ── Login page ────────────────────────────────────────────────────────────────
+def _login_page(redirect_uri: str, state: str, error: str = "", success: str = "") -> str:
+    alert = ""
+    if error:
+        alert = f'<div class="alert alert-error">{error}</div>'
+    elif success:
+        alert = f'<div class="alert alert-success">{success}</div>'
+
+    body = f"""
   <div class="card">
     <div class="logo">💸</div>
     <h1>Expense Tracker</h1>
     <p class="subtitle">Sign in to connect with Claude</p>
-    {error_html}
+    {alert}
     <form method="POST" action="/login">
       <input type="hidden" name="redirect_uri" value="{redirect_uri}">
       <input type="hidden" name="state" value="{state}">
@@ -495,15 +479,68 @@ def _login_page(redirect_uri: str, state: str, error: str = "") -> str:
       <input type="email" id="email" name="email" placeholder="you@example.com" required autofocus>
       <label for="password">Password</label>
       <input type="password" id="password" name="password" placeholder="••••••••" required>
-      <button type="submit">Sign In</button>
+      <button type="submit" class="btn">Sign In</button>
     </form>
+    <div class="divider">— or —</div>
+    <a href="/signup?redirect_uri={redirect_uri}&state={state}" class="btn-secondary">
+      Create an account
+    </a>
     <p class="footer">Your data stays private — this only authorizes Claude to access your expenses.</p>
-  </div>
-</body>
-</html>"""
+  </div>"""
+    return _html_shell("Expense Tracker — Sign In", body)
 
-# ── OAuth routes ──────────────────────────────────────────────────────────────
+# ── Sign-up page ──────────────────────────────────────────────────────────────
+def _signup_page(redirect_uri: str, state: str, error: str = "", prefill_email: str = "", prefill_username: str = "") -> str:
+    alert = f'<div class="alert alert-error">{error}</div>' if error else ""
+    body = f"""
+  <div class="card">
+    <div class="logo">💸</div>
+    <h1>Create Account</h1>
+    <p class="subtitle">Set up your Expense Tracker account</p>
+    {alert}
+    <form method="POST" action="/signup">
+      <input type="hidden" name="redirect_uri" value="{redirect_uri}">
+      <input type="hidden" name="state" value="{state}">
+      <label for="username">Username</label>
+      <input type="text" id="username" name="username" placeholder="yourname" value="{prefill_username}" required autofocus>
+      <label for="email">Email</label>
+      <input type="email" id="email" name="email" placeholder="you@example.com" value="{prefill_email}" required>
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" placeholder="Min. 8 characters" required>
+      <label for="confirm">Confirm Password</label>
+      <input type="password" id="confirm" name="confirm" placeholder="Repeat password" required>
+      <button type="submit" class="btn">Create Account</button>
+    </form>
+    <div class="divider">— or —</div>
+    <a href="/login?redirect_uri={redirect_uri}&state={state}" class="btn-secondary">
+      Already have an account? Sign in
+    </a>
+    <p class="footer">Your data stays private — this only authorizes Claude to access your expenses.</p>
+  </div>"""
+    return _html_shell("Expense Tracker — Create Account", body)
+
+# ── OAuth code helper ─────────────────────────────────────────────────────────
+def _create_oauth_code(conn, user_id: int, redirect_uri: str) -> str:
+    code = secrets.token_urlsafe(32)
+    expires_at = (now_utc() + timedelta(minutes=10)).isoformat()
+    ex(conn,
+        "INSERT INTO oauth_codes(code, user_id, redirect_uri, expires_at) VALUES (?,?,?,?)",
+        [code, user_id, redirect_uri, expires_at]
+    )
+    conn.commit()
+    return code
+
+def _redirect_with_code(redirect_uri: str, code: str, state: str) -> RedirectResponse:
+    separator = "&" if "?" in redirect_uri else "?"
+    return RedirectResponse(
+        url=f"{redirect_uri}{separator}code={code}&state={state}",
+        status_code=302
+    )
+
+# ── OAuth & auth routes ───────────────────────────────────────────────────────
 def _attach_oauth_routes(fastapi_app: FastAPI):
+
+    # ── OAuth discovery ───────────────────────────────────────────────────────
 
     @fastapi_app.get("/.well-known/oauth-protected-resource")
     @fastapi_app.get("/.well-known/oauth-protected-resource/mcp")
@@ -525,6 +562,7 @@ def _attach_oauth_routes(fastapi_app: FastAPI):
             "code_challenge_methods_supported": ["S256"],
         })
 
+    # ── OAuth client registration (Claude handshake — NOT user signup) ────────
     @fastapi_app.post("/register")
     async def register_oauth_client(request: Request):
         body = await request.json()
@@ -537,6 +575,7 @@ def _attach_oauth_routes(fastapi_app: FastAPI):
             "token_endpoint_auth_method": "client_secret_post",
         })
 
+    # ── /authorize → show login page ──────────────────────────────────────────
     @fastapi_app.get("/authorize")
     async def authorize(
         redirect_uri: str = "",
@@ -548,6 +587,7 @@ def _attach_oauth_routes(fastapi_app: FastAPI):
     ):
         return HTMLResponse(_login_page(redirect_uri, state))
 
+    # ── Login ─────────────────────────────────────────────────────────────────
     @fastapi_app.get("/login")
     async def login_get(redirect_uri: str = "", state: str = ""):
         return HTMLResponse(_login_page(redirect_uri, state))
@@ -572,28 +612,82 @@ def _attach_oauth_routes(fastapi_app: FastAPI):
 
         user = rows[0]
         if not user["is_active"]:
-            return HTMLResponse(_login_page(redirect_uri, state, error="Account is inactive."))
+            return HTMLResponse(_login_page(redirect_uri, state, error="Your account is inactive. Please contact support."))
         if not verify_password(password, user["password"]):
             return HTMLResponse(_login_page(redirect_uri, state, error="Invalid email or password."))
 
-        # Short-lived auth code stored in Turso (expires in 10 min, single-use)
-        code = secrets.token_urlsafe(32)
-        expires_at = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
         try:
-            ex(conn,
-                "INSERT INTO oauth_codes(code, user_id, redirect_uri, expires_at) VALUES (?,?,?,?)",
-                [code, user["id"], redirect_uri, expires_at]
-            )
-            conn.commit()
+            code = _create_oauth_code(conn, user["id"], redirect_uri)
         except Exception:
             return HTMLResponse(_login_page(redirect_uri, state, error="Failed to create session, please try again."))
 
-        separator = "&" if "?" in redirect_uri else "?"
-        return RedirectResponse(
-            url=f"{redirect_uri}{separator}code={code}&state={state}",
-            status_code=302
-        )
+        return _redirect_with_code(redirect_uri, code, state)
 
+    # ── Sign-up ───────────────────────────────────────────────────────────────
+    @fastapi_app.get("/signup")
+    async def signup_get(redirect_uri: str = "", state: str = ""):
+        return HTMLResponse(_signup_page(redirect_uri, state))
+
+    @fastapi_app.post("/signup")
+    async def signup_post(
+        request: Request,
+        username: str = Form(...),
+        email: str = Form(...),
+        password: str = Form(...),
+        confirm: str = Form(...),
+        redirect_uri: str = Form(...),
+        state: str = Form(""),
+    ):
+        # Client-side validations re-checked server-side
+        if len(username) < 3:
+            return HTMLResponse(_signup_page(redirect_uri, state,
+                error="Username must be at least 3 characters.",
+                prefill_email=email, prefill_username=username))
+
+        if len(password) < 8:
+            return HTMLResponse(_signup_page(redirect_uri, state,
+                error="Password must be at least 8 characters.",
+                prefill_email=email, prefill_username=username))
+
+        if password != confirm:
+            return HTMLResponse(_signup_page(redirect_uri, state,
+                error="Passwords do not match.",
+                prefill_email=email, prefill_username=username))
+
+        try:
+            conn = get_conn()
+            cur = ex(conn, "SELECT id FROM users WHERE email = ? OR username = ?", [email, username])
+            if cur.fetchone():
+                return HTMLResponse(_signup_page(redirect_uri, state,
+                    error="That username or email is already registered. Try signing in instead.",
+                    prefill_email=email, prefill_username=username))
+
+            hashed_pw  = hash_password(password)
+            api_key    = generate_api_key()
+            created_at = now_utc().isoformat()
+
+            cur = ex(conn,
+                "INSERT INTO users(username, email, password, api_key, created_at) VALUES (?,?,?,?,?)",
+                [username, email, hashed_pw, api_key, created_at]
+            )
+            conn.commit()
+            user_id = cur.lastrowid
+        except Exception as e:
+            return HTMLResponse(_signup_page(redirect_uri, state,
+                error="Registration failed, please try again.",
+                prefill_email=email, prefill_username=username))
+
+        # Auto-login after registration — issue OAuth code immediately
+        try:
+            code = _create_oauth_code(conn, user_id, redirect_uri)
+        except Exception:
+            # Registration succeeded but code failed — send back to login with success msg
+            return HTMLResponse(_login_page(redirect_uri, state,
+                success=f"Account created! Welcome, {username}. Please sign in."))
+
+        return _redirect_with_code(redirect_uri, code, state)
+
+    # ── Token exchange ────────────────────────────────────────────────────────
     @fastapi_app.post("/token")
     async def token(request: Request):
         content_type = request.headers.get("content-type", "")
@@ -625,8 +719,7 @@ def _attach_oauth_routes(fastapi_app: FastAPI):
         if row["used"]:
             return JSONResponse({"error": "code already used"}, status_code=400)
 
-        expires_at = datetime.fromisoformat(row["expires_at"])
-        if datetime.now(timezone.utc) > expires_at:
+        if now_utc() > parse_utc(row["expires_at"]):
             return JSONResponse({"error": "code expired"}, status_code=400)
 
         # Mark code as used (single-use enforcement)
@@ -653,10 +746,9 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8080))
 
-    # Create a real FastAPI app so we can register routes on it,
-    # then mount the MCP Starlette app inside it at /mcp.
-    fastapi_app = FastAPI(title="ExpenseTracker MCP")
+    mcp_app = mcp.http_app()
+    fastapi_app = FastAPI(title="ExpenseTracker MCP", lifespan=mcp_app.lifespan)
     _attach_oauth_routes(fastapi_app)
-    fastapi_app.mount("/", mcp.http_app())
+    fastapi_app.mount("/", mcp_app)
 
     uvicorn.run(fastapi_app, host="0.0.0.0", port=port)
