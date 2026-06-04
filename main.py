@@ -3,11 +3,13 @@ import json
 import os
 import secrets
 from pathlib import Path
+from urllib.parse import quote as url_quote
 
 import bcrypt
 import jwt
 import libsql_experimental as libsql
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_http_request
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse
 
@@ -15,11 +17,11 @@ from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse
 BASE_DIR = Path(__file__).resolve().parent
 CATEGORIES_PATH = BASE_DIR / "categories.json"
 
-DB_URL          = os.environ.get("TURSO_DATABASE_URL", f"file:{BASE_DIR / 'expenses.db'}")
-DB_TOKEN        = os.environ.get("TURSO_AUTH_TOKEN", "")
-JWT_SECRET      = os.environ.get("JWT_SECRET", "change-me-in-production-please")
+DB_URL           = os.environ.get("TURSO_DATABASE_URL", f"file:{BASE_DIR / 'expenses.db'}")
+DB_TOKEN         = os.environ.get("TURSO_AUTH_TOKEN", "")
+JWT_SECRET       = os.environ.get("JWT_SECRET", "change-me-in-production-please")
 JWT_EXPIRY_HOURS = int(os.environ.get("JWT_EXPIRY_HOURS", "72"))
-BASE_URL        = os.environ.get("MCP_BASE_URL", "https://heet-expenses-mcp.onrender.com")
+BASE_URL         = os.environ.get("MCP_BASE_URL", "https://heet-expenses-mcp.onrender.com")
 
 mcp = FastMCP("ExpenseTracker", auth=None)
 
@@ -72,7 +74,7 @@ def generate_api_key() -> str:
     return "ek_" + secrets.token_hex(32)
 
 def generate_jwt(user_id: int, username: str, days: int = None, hours: int = None) -> str:
-    expiry = timedelta(days=days) if days else timedelta(hours=hours or JWT_EXPIRY_HOURS)
+    expiry = timedelta(days=days) if days is not None else timedelta(hours=hours or JWT_EXPIRY_HOURS)
     payload = {
         "sub": user_id,
         "username": username,
@@ -81,8 +83,30 @@ def generate_jwt(user_id: int, username: str, days: int = None, hours: int = Non
     }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def parse_utc(iso_str: str) -> datetime:
+    """Parse ISO datetime string, always returning a timezone-aware UTC datetime."""
+    dt = datetime.fromisoformat(iso_str)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
 def resolve_user(api_key: str = None, token: str = None) -> dict:
-    """Resolve user from api_key or JWT token. Returns user dict or raises."""
+    """Resolve user from api_key or JWT token.
+    Automatically extracts Bearer token from Authorization header if neither is provided.
+    """
+    # Auto-extract Bearer token from HTTP Authorization header
+    if not api_key and not token:
+        try:
+            request = get_http_request()
+            auth_header = request.headers.get("authorization", "")
+            if auth_header.lower().startswith("bearer "):
+                token = auth_header[7:].strip()
+        except Exception:
+            pass
+
     if not api_key and not token:
         raise ValueError("Authentication required: provide api_key or token")
 
@@ -102,6 +126,8 @@ def resolve_user(api_key: str = None, token: str = None) -> dict:
             raise ValueError("Token expired — please login again")
         except jwt.InvalidTokenError:
             raise ValueError("Invalid token")
+        except Exception as e:
+            raise ValueError(f"Token validation failed: {e}")
 
         cur = ex(conn, "SELECT id, username, email FROM users WHERE id = ? AND is_active = 1", [payload["sub"]])
         rows = rows_to_dicts(cur)
@@ -109,15 +135,7 @@ def resolve_user(api_key: str = None, token: str = None) -> dict:
             raise ValueError("User not found or inactive")
         return rows[0]
 
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-def parse_utc(iso_str: str) -> datetime:
-    """Parse ISO datetime string, ensuring it's timezone-aware UTC."""
-    dt = datetime.fromisoformat(iso_str)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
+    raise ValueError("Authentication failed")
 
 # ── DB Init ───────────────────────────────────────────────────────────────────
 def init_db():
@@ -153,7 +171,6 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_expenses_user_date ON expenses(user_id, date)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_expenses_user_cat  ON expenses(user_id, category)")
 
-        # OAuth authorization codes — short-lived, single-use
         conn.execute("""
             CREATE TABLE IF NOT EXISTS oauth_codes (
                 code         TEXT PRIMARY KEY,
@@ -299,11 +316,14 @@ def update_expense(expense_id: int, date: str = None, amount=None, category: str
     user = resolve_user(api_key, token)
 
     conn = get_conn()
-    cur = ex(conn, "SELECT id FROM expenses WHERE id = ? AND user_id = ?", [expense_id, user["id"]])
-    if not cur.fetchone():
+    cur = ex(conn, "SELECT id, category FROM expenses WHERE id = ? AND user_id = ?", [expense_id, user["id"]])
+    rows = rows_to_dicts(cur)
+    if not rows:
         return {"status": "not_found"}
 
+    current_category = rows[0]["category"]
     updates, params = [], []
+
     if date is not None:
         updates.append("date = ?"); params.append(validate_iso_date(date))
     if amount is not None:
@@ -312,6 +332,9 @@ def update_expense(expense_id: int, date: str = None, amount=None, category: str
         validate_category(category, subcategory or "")
         updates.append("category = ?"); params.append(category)
     if subcategory is not None:
+        # Validate subcategory against the new category (if changing) or existing one
+        effective_cat = category if category is not None else current_category
+        validate_category(effective_cat, subcategory)
         updates.append("subcategory = ?"); params.append(subcategory)
     if note is not None:
         updates.append("note = ?"); params.append(note)
@@ -437,9 +460,7 @@ _BASE_STYLES = """
       text-decoration: none; display: block;
     }
     .btn-secondary:hover { border-color: #6366f1; color: #a5b4fc; }
-    .alert {
-      border-radius: 8px; padding: 10px 14px; font-size: 13px; margin-bottom: 18px;
-    }
+    .alert { border-radius: 8px; padding: 10px 14px; font-size: 13px; margin-bottom: 18px; }
     .alert-error { background: #3f1515; border: 1px solid #7f1d1d; color: #fca5a5; }
     .alert-success { background: #14291a; border: 1px solid #166534; color: #86efac; }
     .divider { text-align: center; color: #334155; font-size: 12px; margin: 16px 0; }
@@ -458,6 +479,10 @@ def _html_shell(title: str, body: str) -> str:
 <body>{body}</body>
 </html>"""
 
+def _esc(value: str) -> str:
+    """HTML-escape a value for use inside attribute quotes."""
+    return value.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;")
+
 # ── Login page ────────────────────────────────────────────────────────────────
 def _login_page(redirect_uri: str, state: str, error: str = "", success: str = "") -> str:
     alert = ""
@@ -466,6 +491,9 @@ def _login_page(redirect_uri: str, state: str, error: str = "", success: str = "
     elif success:
         alert = f'<div class="alert alert-success">{success}</div>'
 
+    safe_redirect = url_quote(redirect_uri, safe="")
+    safe_state    = url_quote(state, safe="")
+
     body = f"""
   <div class="card">
     <div class="logo">💸</div>
@@ -473,8 +501,8 @@ def _login_page(redirect_uri: str, state: str, error: str = "", success: str = "
     <p class="subtitle">Sign in to connect with Claude</p>
     {alert}
     <form method="POST" action="/login">
-      <input type="hidden" name="redirect_uri" value="{redirect_uri}">
-      <input type="hidden" name="state" value="{state}">
+      <input type="hidden" name="redirect_uri" value="{_esc(redirect_uri)}">
+      <input type="hidden" name="state" value="{_esc(state)}">
       <label for="email">Email</label>
       <input type="email" id="email" name="email" placeholder="you@example.com" required autofocus>
       <label for="password">Password</label>
@@ -482,7 +510,7 @@ def _login_page(redirect_uri: str, state: str, error: str = "", success: str = "
       <button type="submit" class="btn">Sign In</button>
     </form>
     <div class="divider">— or —</div>
-    <a href="/signup?redirect_uri={redirect_uri}&state={state}" class="btn-secondary">
+    <a href="/signup?redirect_uri={safe_redirect}&state={safe_state}" class="btn-secondary">
       Create an account
     </a>
     <p class="footer">Your data stays private — this only authorizes Claude to access your expenses.</p>
@@ -490,8 +518,13 @@ def _login_page(redirect_uri: str, state: str, error: str = "", success: str = "
     return _html_shell("Expense Tracker — Sign In", body)
 
 # ── Sign-up page ──────────────────────────────────────────────────────────────
-def _signup_page(redirect_uri: str, state: str, error: str = "", prefill_email: str = "", prefill_username: str = "") -> str:
+def _signup_page(redirect_uri: str, state: str, error: str = "",
+                 prefill_email: str = "", prefill_username: str = "") -> str:
     alert = f'<div class="alert alert-error">{error}</div>' if error else ""
+
+    safe_redirect = url_quote(redirect_uri, safe="")
+    safe_state    = url_quote(state, safe="")
+
     body = f"""
   <div class="card">
     <div class="logo">💸</div>
@@ -499,12 +532,14 @@ def _signup_page(redirect_uri: str, state: str, error: str = "", prefill_email: 
     <p class="subtitle">Set up your Expense Tracker account</p>
     {alert}
     <form method="POST" action="/signup">
-      <input type="hidden" name="redirect_uri" value="{redirect_uri}">
-      <input type="hidden" name="state" value="{state}">
+      <input type="hidden" name="redirect_uri" value="{_esc(redirect_uri)}">
+      <input type="hidden" name="state" value="{_esc(state)}">
       <label for="username">Username</label>
-      <input type="text" id="username" name="username" placeholder="yourname" value="{prefill_username}" required autofocus>
+      <input type="text" id="username" name="username" placeholder="yourname"
+             value="{_esc(prefill_username)}" required autofocus>
       <label for="email">Email</label>
-      <input type="email" id="email" name="email" placeholder="you@example.com" value="{prefill_email}" required>
+      <input type="email" id="email" name="email" placeholder="you@example.com"
+             value="{_esc(prefill_email)}" required>
       <label for="password">Password</label>
       <input type="password" id="password" name="password" placeholder="Min. 8 characters" required>
       <label for="confirm">Confirm Password</label>
@@ -512,7 +547,7 @@ def _signup_page(redirect_uri: str, state: str, error: str = "", prefill_email: 
       <button type="submit" class="btn">Create Account</button>
     </form>
     <div class="divider">— or —</div>
-    <a href="/login?redirect_uri={redirect_uri}&state={state}" class="btn-secondary">
+    <a href="/login?redirect_uri={safe_redirect}&state={safe_state}" class="btn-secondary">
       Already have an account? Sign in
     </a>
     <p class="footer">Your data stays private — this only authorizes Claude to access your expenses.</p>
@@ -540,8 +575,6 @@ def _redirect_with_code(redirect_uri: str, code: str, state: str) -> RedirectRes
 # ── OAuth & auth routes ───────────────────────────────────────────────────────
 def _attach_oauth_routes(fastapi_app: FastAPI):
 
-    # ── OAuth discovery ───────────────────────────────────────────────────────
-
     @fastapi_app.get("/.well-known/oauth-protected-resource")
     @fastapi_app.get("/.well-known/oauth-protected-resource/mcp")
     async def oauth_protected_resource():
@@ -562,7 +595,7 @@ def _attach_oauth_routes(fastapi_app: FastAPI):
             "code_challenge_methods_supported": ["S256"],
         })
 
-    # ── OAuth client registration (Claude handshake — NOT user signup) ────────
+    # OAuth client registration — this is Claude's handshake, NOT user signup
     @fastapi_app.post("/register")
     async def register_oauth_client(request: Request):
         body = await request.json()
@@ -575,7 +608,6 @@ def _attach_oauth_routes(fastapi_app: FastAPI):
             "token_endpoint_auth_method": "client_secret_post",
         })
 
-    # ── /authorize → show login page ──────────────────────────────────────────
     @fastapi_app.get("/authorize")
     async def authorize(
         redirect_uri: str = "",
@@ -612,14 +644,16 @@ def _attach_oauth_routes(fastapi_app: FastAPI):
 
         user = rows[0]
         if not user["is_active"]:
-            return HTMLResponse(_login_page(redirect_uri, state, error="Your account is inactive. Please contact support."))
+            return HTMLResponse(_login_page(redirect_uri, state,
+                error="Your account is inactive. Please contact support."))
         if not verify_password(password, user["password"]):
             return HTMLResponse(_login_page(redirect_uri, state, error="Invalid email or password."))
 
         try:
             code = _create_oauth_code(conn, user["id"], redirect_uri)
         except Exception:
-            return HTMLResponse(_login_page(redirect_uri, state, error="Failed to create session, please try again."))
+            return HTMLResponse(_login_page(redirect_uri, state,
+                error="Failed to create session, please try again."))
 
         return _redirect_with_code(redirect_uri, code, state)
 
@@ -638,22 +672,20 @@ def _attach_oauth_routes(fastapi_app: FastAPI):
         redirect_uri: str = Form(...),
         state: str = Form(""),
     ):
-        # Client-side validations re-checked server-side
         if len(username) < 3:
             return HTMLResponse(_signup_page(redirect_uri, state,
                 error="Username must be at least 3 characters.",
                 prefill_email=email, prefill_username=username))
-
         if len(password) < 8:
             return HTMLResponse(_signup_page(redirect_uri, state,
                 error="Password must be at least 8 characters.",
                 prefill_email=email, prefill_username=username))
-
         if password != confirm:
             return HTMLResponse(_signup_page(redirect_uri, state,
                 error="Passwords do not match.",
                 prefill_email=email, prefill_username=username))
 
+        # Step 1: insert user (separate try so user_id is guaranteed post-commit)
         try:
             conn = get_conn()
             cur = ex(conn, "SELECT id FROM users WHERE email = ? OR username = ?", [email, username])
@@ -665,23 +697,21 @@ def _attach_oauth_routes(fastapi_app: FastAPI):
             hashed_pw  = hash_password(password)
             api_key    = generate_api_key()
             created_at = now_utc().isoformat()
-
             cur = ex(conn,
                 "INSERT INTO users(username, email, password, api_key, created_at) VALUES (?,?,?,?,?)",
                 [username, email, hashed_pw, api_key, created_at]
             )
             conn.commit()
-            user_id = cur.lastrowid
-        except Exception as e:
+            user_id = cur.lastrowid  # only safe to read after commit
+        except Exception:
             return HTMLResponse(_signup_page(redirect_uri, state,
                 error="Registration failed, please try again.",
                 prefill_email=email, prefill_username=username))
 
-        # Auto-login after registration — issue OAuth code immediately
+        # Step 2: issue OAuth code — user is guaranteed saved at this point
         try:
             code = _create_oauth_code(conn, user_id, redirect_uri)
         except Exception:
-            # Registration succeeded but code failed — send back to login with success msg
             return HTMLResponse(_login_page(redirect_uri, state,
                 success=f"Account created! Welcome, {username}. Please sign in."))
 
@@ -704,9 +734,7 @@ def _attach_oauth_routes(fastapi_app: FastAPI):
         try:
             conn = get_conn()
             cur = ex(conn,
-                "SELECT user_id, expires_at, used FROM oauth_codes WHERE code = ?",
-                [code]
-            )
+                "SELECT user_id, expires_at, used FROM oauth_codes WHERE code = ?", [code])
             rows = rows_to_dicts(cur)
         except Exception:
             return JSONResponse({"error": "database error"}, status_code=500)
@@ -715,18 +743,14 @@ def _attach_oauth_routes(fastapi_app: FastAPI):
             return JSONResponse({"error": "invalid code"}, status_code=400)
 
         row = rows[0]
-
         if row["used"]:
             return JSONResponse({"error": "code already used"}, status_code=400)
-
         if now_utc() > parse_utc(row["expires_at"]):
             return JSONResponse({"error": "code expired"}, status_code=400)
 
-        # Mark code as used (single-use enforcement)
         ex(conn, "UPDATE oauth_codes SET used = 1 WHERE code = ?", [code])
         conn.commit()
 
-        # Fetch user and issue 30-day JWT
         cur = ex(conn, "SELECT id, username FROM users WHERE id = ? AND is_active = 1", [row["user_id"]])
         user_rows = rows_to_dicts(cur)
         if not user_rows:
