@@ -102,7 +102,11 @@ def resolve_user(api_key: str = None, token: str = None) -> dict:
             request = get_http_request()
             auth_header = request.headers.get("authorization", "")
             if auth_header.lower().startswith("bearer "):
-                token = auth_header[7:].strip()
+                val = auth_header[7:].strip()
+                if val.startswith("ek_"):
+                    api_key = val
+                else:
+                    token = val
         except Exception:
             pass
 
@@ -110,29 +114,31 @@ def resolve_user(api_key: str = None, token: str = None) -> dict:
         raise ValueError("Authentication required: provide api_key or token")
 
     conn = get_conn()
+    try:
+        if api_key:
+            cur = ex(conn, "SELECT id, username, email FROM users WHERE api_key = ? AND is_active = 1", [api_key])
+            rows = rows_to_dicts(cur)
+            if not rows:
+                raise ValueError("Invalid or inactive API key")
+            return rows[0]
 
-    if api_key:
-        cur = ex(conn, "SELECT id, username, email FROM users WHERE api_key = ? AND is_active = 1", [api_key])
-        rows = rows_to_dicts(cur)
-        if not rows:
-            raise ValueError("Invalid or inactive API key")
-        return rows[0]
+        if token:
+            try:
+                payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+            except jwt.ExpiredSignatureError:
+                raise ValueError("Token expired — please login again")
+            except jwt.InvalidTokenError:
+                raise ValueError("Invalid token")
+            except Exception as e:
+                raise ValueError(f"Token validation failed: {e}")
 
-    if token:
-        try:
-            payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        except jwt.ExpiredSignatureError:
-            raise ValueError("Token expired — please login again")
-        except jwt.InvalidTokenError:
-            raise ValueError("Invalid token")
-        except Exception as e:
-            raise ValueError(f"Token validation failed: {e}")
-
-        cur = ex(conn, "SELECT id, username, email FROM users WHERE id = ? AND is_active = 1", [int(payload["sub"])])
-        rows = rows_to_dicts(cur)
-        if not rows:
-            raise ValueError("User not found or inactive")
-        return rows[0]
+            cur = ex(conn, "SELECT id, username, email FROM users WHERE id = ? AND is_active = 1", [int(payload["sub"])])
+            rows = rows_to_dicts(cur)
+            if not rows:
+                raise ValueError("User not found or inactive")
+            return rows[0]
+    finally:
+        conn.close()
 
     raise ValueError("Authentication failed")
 
@@ -689,13 +695,72 @@ def _attach_oauth_routes(fastapi_app: FastAPI):
         })
 
 
+mcp_app = mcp.http_app()
+fastapi_app = FastAPI(title="ExpenseTracker MCP", lifespan=mcp_app.lifespan)
+
+@fastapi_app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    if request.url.path.startswith("/mcp") and request.method != "OPTIONS":
+        auth_header = request.headers.get("authorization", "")
+        if not auth_header or not auth_header.lower().startswith("bearer "):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Authentication required"},
+                headers={
+                    "WWW-Authenticate": f'Bearer resource_metadata="{BASE_URL}/.well-known/oauth-protected-resource"'
+                }
+            )
+        
+        token_or_key = auth_header[7:].strip()
+        conn = get_conn()
+        try:
+            if token_or_key.startswith("ek_"):
+                cur = ex(conn, "SELECT id FROM users WHERE api_key = ? AND is_active = 1", [token_or_key])
+                if not cur.fetchone():
+                    return JSONResponse(
+                        status_code=401,
+                        content={"detail": "Invalid or inactive API key"},
+                        headers={
+                            "WWW-Authenticate": f'Bearer resource_metadata="{BASE_URL}/.well-known/oauth-protected-resource"'
+                        }
+                    )
+            else:
+                try:
+                    payload = jwt.decode(token_or_key, JWT_SECRET, algorithms=["HS256"])
+                    cur = ex(conn, "SELECT id FROM users WHERE id = ? AND is_active = 1", [int(payload["sub"])])
+                    if not cur.fetchone():
+                        return JSONResponse(
+                            status_code=401,
+                            content={"detail": "User not found or inactive"},
+                            headers={
+                                "WWW-Authenticate": f'Bearer resource_metadata="{BASE_URL}/.well-known/oauth-protected-resource"'
+                            }
+                        )
+                except jwt.ExpiredSignatureError:
+                    return JSONResponse(
+                        status_code=401,
+                        content={"detail": "Token expired — please login again"},
+                        headers={
+                            "WWW-Authenticate": f'Bearer resource_metadata="{BASE_URL}/.well-known/oauth-protected-resource"'
+                        }
+                    )
+                except Exception:
+                    return JSONResponse(
+                        status_code=401,
+                        content={"detail": "Invalid token"},
+                        headers={
+                            "WWW-Authenticate": f'Bearer resource_metadata="{BASE_URL}/.well-known/oauth-protected-resource"'
+                        }
+                    )
+        finally:
+            conn.close()
+
+    return await call_next(request)
+
+_attach_oauth_routes(fastapi_app)
+fastapi_app.mount("/", mcp_app)
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8080))
-
-    mcp_app = mcp.http_app()
-    fastapi_app = FastAPI(title="ExpenseTracker MCP", lifespan=mcp_app.lifespan)
-    _attach_oauth_routes(fastapi_app)
-    fastapi_app.mount("/", mcp_app)
-
     uvicorn.run(fastapi_app, host="0.0.0.0", port=port)
