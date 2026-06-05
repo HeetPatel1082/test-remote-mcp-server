@@ -76,7 +76,7 @@ def generate_api_key() -> str:
 def generate_jwt(user_id: int, username: str, days: int = None, hours: int = None) -> str:
     expiry = timedelta(days=days) if days is not None else timedelta(hours=hours or JWT_EXPIRY_HOURS)
     payload = {
-        "sub": user_id,
+        "sub": str(user_id),  # PyJWT v3 requires sub to be a string
         "username": username,
         "iat": datetime.now(timezone.utc),
         "exp": datetime.now(timezone.utc) + expiry,
@@ -129,7 +129,7 @@ def resolve_user(api_key: str = None, token: str = None) -> dict:
         except Exception as e:
             raise ValueError(f"Token validation failed: {e}")
 
-        cur = ex(conn, "SELECT id, username, email FROM users WHERE id = ? AND is_active = 1", [payload["sub"]])
+        cur = ex(conn, "SELECT id, username, email FROM users WHERE id = ? AND is_active = 1", [int(payload["sub"])])
         rows = rows_to_dicts(cur)
         if not rows:
             raise ValueError("User not found or inactive")
