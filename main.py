@@ -97,7 +97,6 @@ def resolve_user(api_key: str = None, token: str = None) -> dict:
     """Resolve user from api_key or JWT token.
     Automatically extracts Bearer token from Authorization header if neither is provided.
     """
-    # Auto-extract Bearer token from HTTP Authorization header
     if not api_key and not token:
         try:
             request = get_http_request()
@@ -141,7 +140,6 @@ def resolve_user(api_key: str = None, token: str = None) -> dict:
 def init_db():
     try:
         conn = get_conn()
-
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -155,7 +153,6 @@ def init_db():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_users_api_key ON users(api_key)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
-
         conn.execute("""
             CREATE TABLE IF NOT EXISTS expenses (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -170,7 +167,6 @@ def init_db():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_expenses_user_date ON expenses(user_id, date)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_expenses_user_cat  ON expenses(user_id, category)")
-
         conn.execute("""
             CREATE TABLE IF NOT EXISTS oauth_codes (
                 code         TEXT PRIMARY KEY,
@@ -180,7 +176,6 @@ def init_db():
                 used         INTEGER NOT NULL DEFAULT 0
             )
         """)
-
         conn.commit()
         print("Database initialized successfully")
     except Exception as e:
@@ -188,74 +183,13 @@ def init_db():
 
 init_db()
 
-# ── Auth Tools ────────────────────────────────────────────────────────────────
-
-@mcp.tool()
-def register(username: str, email: str, password: str):
-    """Register a new user. Returns api_key and jwt token."""
-    if len(password) < 8:
-        return {"status": "error", "message": "Password must be at least 8 characters"}
-
-    conn = get_conn()
-    cur = ex(conn, "SELECT id FROM users WHERE email = ? OR username = ?", [email, username])
-    if cur.fetchone():
-        return {"status": "error", "message": "Username or email already exists"}
-
-    hashed_pw  = hash_password(password)
-    api_key    = generate_api_key()
-    created_at = now_utc().isoformat()
-
-    cur = ex(conn,
-        "INSERT INTO users(username, email, password, api_key, created_at) VALUES (?,?,?,?,?)",
-        [username, email, hashed_pw, api_key, created_at]
-    )
-    conn.commit()
-    user_id = cur.lastrowid
-    token = generate_jwt(user_id, username)
-
-    return {
-        "status": "ok",
-        "message": f"Welcome, {username}!",
-        "user_id": user_id,
-        "api_key": api_key,
-        "token": token,
-        "token_expires_in": f"{JWT_EXPIRY_HOURS} hours",
-    }
-
-@mcp.tool()
-def login(email: str, password: str):
-    """Login with email and password. Returns fresh JWT token."""
-    conn = get_conn()
-    cur = ex(conn, "SELECT id, username, password, api_key, is_active FROM users WHERE email = ?", [email])
-    rows = rows_to_dicts(cur)
-
-    if not rows:
-        return {"status": "error", "message": "Invalid email or password"}
-
-    user = rows[0]
-    if not user["is_active"]:
-        return {"status": "error", "message": "Account is inactive"}
-    if not verify_password(password, user["password"]):
-        return {"status": "error", "message": "Invalid email or password"}
-
-    token = generate_jwt(user["id"], user["username"])
-
-    return {
-        "status": "ok",
-        "message": f"Welcome back, {user['username']}!",
-        "user_id": user["id"],
-        "api_key": user["api_key"],
-        "token": token,
-        "token_expires_in": f"{JWT_EXPIRY_HOURS} hours",
-    }
+# ── MCP Tools ─────────────────────────────────────────────────────────────────
 
 @mcp.tool()
 def get_profile(api_key: str = None, token: str = None):
-    """Get current user profile."""
+    """Get the currently authenticated user's profile."""
     user = resolve_user(api_key, token)
     return {"status": "ok", "user": user}
-
-# ── Expense Tools ─────────────────────────────────────────────────────────────
 
 @mcp.tool()
 def add_expense(date: str, amount, category: str, subcategory: str = "", note: str = "",
@@ -332,7 +266,6 @@ def update_expense(expense_id: int, date: str = None, amount=None, category: str
         validate_category(category, subcategory or "")
         updates.append("category = ?"); params.append(category)
     if subcategory is not None:
-        # Validate subcategory against the new category (if changing) or existing one
         effective_cat = category if category is not None else current_category
         validate_category(effective_cat, subcategory)
         updates.append("subcategory = ?"); params.append(subcategory)
@@ -419,21 +352,14 @@ def categories():
 _BASE_STYLES = """
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
+      min-height: 100vh; display: flex; align-items: center; justify-content: center;
       background: #0f0f13;
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
       color: #e2e8f0;
     }
     .card {
-      background: #1a1a24;
-      border: 1px solid #2d2d3d;
-      border-radius: 16px;
-      padding: 40px;
-      width: 100%;
-      max-width: 420px;
+      background: #1a1a24; border: 1px solid #2d2d3d; border-radius: 16px;
+      padding: 40px; width: 100%; max-width: 420px;
       box-shadow: 0 20px 60px rgba(0,0,0,0.4);
     }
     .logo { font-size: 28px; margin-bottom: 6px; text-align: center; }
@@ -441,22 +367,21 @@ _BASE_STYLES = """
     .subtitle { text-align: center; font-size: 13px; color: #64748b; margin-bottom: 28px; }
     label { display: block; font-size: 13px; font-weight: 500; color: #94a3b8; margin-bottom: 6px; }
     input {
-      width: 100%; padding: 11px 14px;
-      background: #0f0f13; border: 1px solid #2d2d3d; border-radius: 8px;
-      color: #f1f5f9; font-size: 14px; margin-bottom: 18px;
+      width: 100%; padding: 11px 14px; background: #0f0f13; border: 1px solid #2d2d3d;
+      border-radius: 8px; color: #f1f5f9; font-size: 14px; margin-bottom: 18px;
       outline: none; transition: border-color 0.2s;
     }
     input:focus { border-color: #6366f1; }
     .btn {
-      width: 100%; padding: 12px; background: #6366f1; color: #fff;
-      border: none; border-radius: 8px; font-size: 15px; font-weight: 600;
-      cursor: pointer; transition: background 0.2s;
+      width: 100%; padding: 12px; background: #6366f1; color: #fff; border: none;
+      border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer;
+      transition: background 0.2s;
     }
     .btn:hover { background: #4f46e5; }
     .btn-secondary {
       width: 100%; padding: 11px; background: transparent; color: #94a3b8;
-      border: 1px solid #2d2d3d; border-radius: 8px; font-size: 14px;
-      cursor: pointer; transition: all 0.2s; margin-top: 10px; text-align: center;
+      border: 1px solid #2d2d3d; border-radius: 8px; font-size: 14px; cursor: pointer;
+      transition: all 0.2s; margin-top: 10px; text-align: center;
       text-decoration: none; display: block;
     }
     .btn-secondary:hover { border-color: #6366f1; color: #a5b4fc; }
@@ -480,7 +405,7 @@ def _html_shell(title: str, body: str) -> str:
 </html>"""
 
 def _esc(value: str) -> str:
-    """HTML-escape a value for use inside attribute quotes."""
+    """HTML-escape a value for safe use inside attribute quotes."""
     return value.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;")
 
 # ── Login page ────────────────────────────────────────────────────────────────
@@ -521,7 +446,6 @@ def _login_page(redirect_uri: str, state: str, error: str = "", success: str = "
 def _signup_page(redirect_uri: str, state: str, error: str = "",
                  prefill_email: str = "", prefill_username: str = "") -> str:
     alert = f'<div class="alert alert-error">{error}</div>' if error else ""
-
     safe_redirect = url_quote(redirect_uri, safe="")
     safe_state    = url_quote(state, safe="")
 
@@ -554,7 +478,7 @@ def _signup_page(redirect_uri: str, state: str, error: str = "",
   </div>"""
     return _html_shell("Expense Tracker — Create Account", body)
 
-# ── OAuth code helper ─────────────────────────────────────────────────────────
+# ── OAuth helpers ─────────────────────────────────────────────────────────────
 def _create_oauth_code(conn, user_id: int, redirect_uri: str) -> str:
     code = secrets.token_urlsafe(32)
     expires_at = (now_utc() + timedelta(minutes=10)).isoformat()
@@ -572,7 +496,7 @@ def _redirect_with_code(redirect_uri: str, code: str, state: str) -> RedirectRes
         status_code=302
     )
 
-# ── OAuth & auth routes ───────────────────────────────────────────────────────
+# ── OAuth & web auth routes ───────────────────────────────────────────────────
 def _attach_oauth_routes(fastapi_app: FastAPI):
 
     @fastapi_app.get("/.well-known/oauth-protected-resource")
@@ -581,6 +505,9 @@ def _attach_oauth_routes(fastapi_app: FastAPI):
         return JSONResponse({
             "resource": BASE_URL,
             "authorization_servers": [BASE_URL],
+            "bearer_methods_supported": ["header"],
+            "resource_signing_alg_values_supported": ["RS256"],
+            "scopes_supported": ["expenses:read", "expenses:write"],
         })
 
     @fastapi_app.get("/.well-known/oauth-authorization-server")
@@ -595,7 +522,7 @@ def _attach_oauth_routes(fastapi_app: FastAPI):
             "code_challenge_methods_supported": ["S256"],
         })
 
-    # OAuth client registration — this is Claude's handshake, NOT user signup
+    # Claude's OAuth client registration handshake (NOT user signup)
     @fastapi_app.post("/register")
     async def register_oauth_client(request: Request):
         body = await request.json()
@@ -610,12 +537,8 @@ def _attach_oauth_routes(fastapi_app: FastAPI):
 
     @fastapi_app.get("/authorize")
     async def authorize(
-        redirect_uri: str = "",
-        state: str = "",
-        response_type: str = "code",
-        client_id: str = "",
-        code_challenge: str = "",
-        code_challenge_method: str = "",
+        redirect_uri: str = "", state: str = "", response_type: str = "code",
+        client_id: str = "", code_challenge: str = "", code_challenge_method: str = "",
     ):
         return HTMLResponse(_login_page(redirect_uri, state))
 
@@ -685,7 +608,7 @@ def _attach_oauth_routes(fastapi_app: FastAPI):
                 error="Passwords do not match.",
                 prefill_email=email, prefill_username=username))
 
-        # Step 1: insert user (separate try so user_id is guaranteed post-commit)
+        # Step 1: create user
         try:
             conn = get_conn()
             cur = ex(conn, "SELECT id FROM users WHERE email = ? OR username = ?", [email, username])
@@ -702,13 +625,13 @@ def _attach_oauth_routes(fastapi_app: FastAPI):
                 [username, email, hashed_pw, api_key, created_at]
             )
             conn.commit()
-            user_id = cur.lastrowid  # only safe to read after commit
+            user_id = cur.lastrowid  # only safe after commit
         except Exception:
             return HTMLResponse(_signup_page(redirect_uri, state,
                 error="Registration failed, please try again.",
                 prefill_email=email, prefill_username=username))
 
-        # Step 2: issue OAuth code — user is guaranteed saved at this point
+        # Step 2: auto-login — issue OAuth code immediately
         try:
             code = _create_oauth_code(conn, user_id, redirect_uri)
         except Exception:
